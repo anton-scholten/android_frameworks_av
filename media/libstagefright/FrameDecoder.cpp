@@ -425,6 +425,21 @@ FrameDecoder::~FrameDecoder() {
     }
 }
 
+static void widenRGBA8888ToRGBA1010102(VideoFrame *frame) {
+    uint8_t *row = frame->getFlattenedData();
+    for (uint32_t y = 0; y < frame->mHeight; y++, row += frame->mRowBytes) {
+        uint32_t *pixel = (uint32_t *)row;
+        for (uint32_t x = 0; x < frame->mWidth; x++) {
+            uint32_t p = pixel[x];
+            auto widen = [](uint32_t c) { return (c << 2) | (c >> 6); };
+            pixel[x] = widen(p & 0xff)
+                    | (widen((p >> 8) & 0xff) << 10)
+                    | (widen((p >> 16) & 0xff) << 20)
+                    | (3u << 30);
+        }
+    }
+}
+
 bool isHDR(const sp<AMessage> &format) {
     uint32_t standard, transfer;
     if (!format->findInt32("color-standard", (int32_t*)&standard)) {
@@ -809,14 +824,24 @@ status_t FrameDecoder::handleOutputBufferAsync(int32_t index, int64_t timeUs) {
 
         std::unique_ptr<const C2GraphicView> view(std::make_unique<const C2GraphicView>(
             c2buffer->data().graphicBlocks()[0].map().get()));
-        GraphicView2MediaImageConverter converter(*view, mOutputFormat, false /* copy */);
-        if (converter.initCheck() != OK) {
-            ALOGE("Converter init failed: %d", converter.initCheck());
+        auto converter = std::make_unique<GraphicView2MediaImageConverter>(
+                *view, mOutputFormat, false /* copy */);
+        int32_t colorFormat;
+        if (converter->initCheck() != OK
+                && mOutputFormat->findInt32(KEY_COLOR_FORMAT, &colorFormat)
+                && colorFormat == COLOR_FormatYUVP010) {
+            // The decoder ignored the P010 request and returned an 8-bit buffer.
+            mOutputFormat->setInt32(KEY_COLOR_FORMAT, COLOR_FormatYUV420Flexible);
+            converter = std::make_unique<GraphicView2MediaImageConverter>(
+                    *view, mOutputFormat, false /* copy */);
+        }
+        if (converter->initCheck() != OK) {
+            ALOGE("Converter init failed: %d", converter->initCheck());
             return NO_INIT;
         }
 
-        uint8_t* frameData = converter.wrap()->data();
-        sp<ABuffer> imageData = converter.imageData();
+        uint8_t* frameData = converter->wrap()->data();
+        sp<ABuffer> imageData = converter->imageData();
         if (imageData != nullptr) {
             mOutputFormat->setBuffer("image-data", imageData);
             MediaImage2 *img = (MediaImage2*) imageData->data();
@@ -1031,8 +1056,6 @@ status_t VideoFrameDecoder::onOutputReceived(
     if (mCaptureLayer != nullptr) {
         return captureSurface();
     }
-    ColorConverter colorConverter((OMX_COLOR_FORMATTYPE)srcFormat, dstFormat());
-
     uint32_t standard, range, transfer;
     if (!outputFormat->findInt32("color-standard", (int32_t*)&standard)) {
         standard = 0;
@@ -1044,18 +1067,23 @@ status_t VideoFrameDecoder::onOutputReceived(
         transfer = 0;
     }
 
+    MediaImage2 *imageData = nullptr;
     if (imgObj != nullptr) {
-        MediaImage2 *imageData = nullptr;
         imageData = (MediaImage2 *)(imgObj.get()->data());
-        if (imageData != nullptr) {
-            colorConverter.setSrcMediaImage2(*imageData);
-        }
     }
     if (srcFormat == COLOR_FormatYUV420Flexible && imgObj.get() == nullptr) {
         return ERROR_UNSUPPORTED;
     }
-    colorConverter.setSrcColorSpace(standard, range, transfer);
-    if (colorConverter.isValid()) {
+
+    auto convertTo = [&](OMX_COLOR_FORMATTYPE convertFormat) {
+        ColorConverter colorConverter((OMX_COLOR_FORMATTYPE)srcFormat, convertFormat);
+        if (imageData != nullptr) {
+            colorConverter.setSrcMediaImage2(*imageData);
+        }
+        colorConverter.setSrcColorSpace(standard, range, transfer);
+        if (!colorConverter.isValid()) {
+            return false;
+        }
         ScopedTrace trace(ATRACE_TAG, "FrameDecoder::ColorConverter");
         if (frameData == nullptr) {
             ALOGD("frameData is null for ColorConverter");
@@ -1069,6 +1097,18 @@ status_t VideoFrameDecoder::onOutputReceived(
                 // since the frame is allocated with top-left adjusted,
                 // the dst rect should start at {0,0} as well.
                 0, 0, mFrame->mWidth - 1, mFrame->mHeight - 1);
+        return true;
+    };
+
+    if (convertTo(dstFormat())) {
+        return OK;
+    }
+
+    // Decoders that cannot output P010 may ignore the request and return
+    // 8-bit YUV; convert that to RGBA8888 and widen it to RGBA1010102.
+    if (dstFormat() == COLOR_Format32bitABGR2101010 &&
+            convertTo(OMX_COLOR_Format32BitRGBA8888)) {
+        widenRGBA8888ToRGBA1010102(mFrame);
         return OK;
     }
 
